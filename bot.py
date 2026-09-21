@@ -288,6 +288,10 @@ def slot(m):
     if bet % 5 != 0:
         bot.reply_to(m, "Ставка должна быть кратной 5 (например, 10, 15, 20).")
         return
+        
+    if bet > balance:
+        bot.reply_to(m, f"Недостаточно средств. У тебя {balance} 🪙, а ты ставишь {bet}.")
+        return
 
     d = bot.send_dice(m.chat.id, emoji="🎰")
     value = d.dice.value
