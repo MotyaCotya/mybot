@@ -12,6 +12,21 @@ import datetime
 import json
 import threading
 lock = threading.Lock()
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class _Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'{"status":"ok"}')
+    def log_message(self, *args):
+        pass
+
+def _run_server():
+    port = int(os.getenv("PORT", 8000))
+    HTTPServer(("0.0.0.0", port), _Health).serve_forever()
+
+threading.Thread(target=_run_server, daemon=True).start()
 
 BANK_FILE = 'bank.json'
 ROLL_FILE = 'roll_config.json'
