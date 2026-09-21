@@ -1,3 +1,4 @@
 pyTelegramBotAPI
 requests
 telegram-slot-map==1.0.2
+psycopg2-binary
