@@ -11,8 +11,9 @@ from slotmap import get_slot_combination
 import datetime
 import json
 import threading
-lock = threading.Lock()
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+lock = threading.Lock()
 
 class _Health(BaseHTTPRequestHandler):
     def do_GET(self):
