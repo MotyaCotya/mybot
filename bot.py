@@ -1,32 +1,159 @@
 import os
 import telebot
-token = os.getenv("BOT_TOKEN")
-if not token:
-    raise SystemExit("Нет BOT_TOKEN!")
-bot = telebot.TeleBot(token, parse_mode='HTML')
 import requests
 import time
 from collections import Counter
 from slotmap import get_slot_combination
 import datetime
-import json
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-DATA_FILE = "/data/bot_data.json"  # путь на persistent disk
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return {}  # вернёт пустой словарь, если файла нет
+# --- PostgreSQL Setup (Supabase) ---
+import psycopg2
+from psycopg2 import sql, extras
 
-def save_data(data):
-    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@host:5432/dbname")
 
-lock = threading.Lock()
+# Подключение к БД
+conn = psycopg2.connect(DATABASE_URL)
+conn.autocommit = True  # Автокоммит для простых запросов
 
+# --- Helper: Execute SQL safely ---
+def execute_query(query, params=None, fetch=False):
+    """Выполняет SQL-запрос и возвращает результат (если fetch=True)"""
+    with conn.cursor() as cur:
+        try:
+            cur.execute(query, params)
+            if fetch:
+                return cur.fetchall()
+        except Exception as e:
+            print(f"[DB ERROR] {e}")
+            conn.rollback()
+            raise
+
+# --- Helper: Get or Create User ---
+def get_or_create_user(user_id, username=None):
+    """Получает или создаёт пользователя в БД"""
+    # Проверяем, существует ли пользователь
+    query = "SELECT balance, username FROM users WHERE user_id = %s"
+    result = execute_query(query, (user_id,), fetch=True)
+    
+    if result:
+        return result[0]  # (balance, username)
+    
+    # Создаём нового пользователя
+    query = """
+        INSERT INTO users (user_id, username, balance)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE
+        SET username = EXCLUDED.username
+        RETURNING balance, username
+    """
+    execute_query(query, (user_id, username, 100))
+    return (100, username)  # Default balance
+
+# --- Helper: Update User Balance ---
+def update_balance(user_id, new_balance):
+    """Обновляет баланс пользователя"""
+    query = "UPDATE users SET balance = %s WHERE user_id = %s"
+    execute_query(query, (new_balance, user_id))
+
+# --- Helper: Get Roll Cooldown ---
+def get_roll_cooldown(chat_id):
+    """Получает кулдаун для группы"""
+    query = "SELECT cooldown_seconds FROM roll_cooldowns WHERE chat_id = %s"
+    result = execute_query(query, (chat_id,), fetch=True)
+    return result[0][0] if result else 60  # Default: 60 seconds
+
+# --- Helper: Set Roll Cooldown ---
+def set_roll_cooldown(chat_id, seconds):
+    """Устанавливает кулдаун для группы"""
+    query = """
+        INSERT INTO roll_cooldowns (chat_id, cooldown_seconds)
+        VALUES (%s, %s)
+        ON CONFLICT (chat_id) DO UPDATE
+        SET cooldown_seconds = EXCLUDED.cooldown_seconds
+    """
+    execute_query(query, (chat_id, seconds))
+
+# --- Helper: Update Last Roll Time ---
+def update_last_roll(user_id, timestamp):
+    """Обновляет время последнего ролла"""
+    query = "UPDATE users SET last_roll = %s WHERE user_id = %s"
+    execute_query(query, (timestamp, user_id))
+
+# --- Helper: Get Last Roll Time ---
+def get_last_roll(user_id):
+    """Получает время последнего ролла"""
+    query = "SELECT last_roll FROM users WHERE user_id = %s"
+    result = execute_query(query, (user_id,), fetch=True)
+    return result[0][0] if result else 0
+
+# --- Helper: Check Bankruptcy ---
+def check_bankruptcy(user_id):
+    """Проверяет, забирал ли пользователь банкротство сегодня"""
+    query = "SELECT last_bankruptcy FROM users WHERE user_id = %s"
+    result = execute_query(query, (user_id,), fetch=True)
+    last_date = result[0][0] if result else None
+    today = datetime.date.today().isoformat()
+    return last_date == today
+
+# --- Helper: Set Bankruptcy ---
+def set_bankruptcy(user_id):
+    """Устанавливает дату банкротства"""
+    query = "UPDATE users SET last_bankruptcy = %s WHERE user_id = %s"
+    execute_query(query, (datetime.date.today().isoformat(), user_id))
+
+# --- Helper: Get User Balance ---
+def get_balance(user_id):
+    """Получает баланс пользователя"""
+    query = "SELECT balance FROM users WHERE user_id = %s"
+    result = execute_query(query, (user_id,), fetch=True)
+    return result[0][0] if result else 100  # Default balance
+
+# --- Helper: Is Group Admin (with cache) ---
+def is_group_admin(chat_id, user_id):
+    """Проверяет, является ли пользователь админом в группе (с кэшированием)"""
+    # Проверяем кэш в БД
+    query = "SELECT is_admin FROM admin_cache WHERE chat_id = %s AND user_id = %s"
+    result = execute_query(query, (chat_id, user_id), fetch=True)
+    
+    if result:
+        return result[0][0]
+    
+    # Если нет в кэше — проверяем через Telegram API
+    try:
+        member = bot.get_chat_member(chat_id, user_id)
+        is_admin = member.status in ('administrator', 'creator')
+    except Exception:
+        is_admin = False
+    
+    # Сохраняем в кэш
+    query = """
+        INSERT INTO admin_cache (chat_id, user_id, is_admin)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (chat_id, user_id) DO UPDATE
+        SET is_admin = EXCLUDED.is_admin
+    """
+    execute_query(query, (chat_id, user_id, is_admin))
+    return is_admin
+
+# --- Helper: Register User in Group ---
+def register_user_in_group(user_id, chat_id, username):
+    """Регистрирует пользователя в группе (для tops)"""
+    # Проверяем, есть ли пользователь
+    get_or_create_user(user_id, username)
+    
+    # Обновляем last_roll (если нужно)
+    query = """
+        INSERT INTO users (user_id, username, last_roll)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (user_id) DO UPDATE
+        SET username = EXCLUDED.username, last_roll = NOW()
+    """
+    execute_query(query, (user_id, username))
+
+# --- Health Check Server ---
 class _Health(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -41,29 +168,12 @@ def _run_server():
 
 threading.Thread(target=_run_server, daemon=True).start()
 
-BANK_FILE = 'bank.json'
-ROLL_FILE = 'roll_config.json'
+# --- Constants ---
+token = os.getenv("BOT_TOKEN")
+if not token:
+    raise SystemExit("Нет BOT_TOKEN!")
 
-bank = {}
-USED_IN = {}   # user_id → chat_id где играл
-
-if os.path.exists(BANK_FILE):
-    with open(BANK_FILE, 'r', encoding='utf-8') as f:
-        bank = json.load(f)
-    bank = {int(k): v for k, v in bank.items()}
-
-ROLL = {'cooldowns': {}, 'last_roll': {}}
-if os.path.exists(ROLL_FILE):
-    with open(ROLL_FILE, 'r', encoding='utf-8') as f:
-        ROLL.update(json.load(f))
-        ROLL.setdefault('cooldowns', {})
-        ROLL.setdefault('last_roll', {})
-        ROLL['cooldowns'] = {int(k): v for k, v in ROLL['cooldowns'].items()}
-        ROLL['last_roll'] = {int(k): v for k, v in ROLL['last_roll'].items()}
-
-def save_roll():
-    with open(ROLL_FILE, 'w', encoding='utf-8') as f:
-        json.dump(ROLL, f, ensure_ascii=False, indent=2)
+bot = telebot.TeleBot(token, parse_mode='HTML')
 
 MY_SYMBOLS = {
     'bar': '➖',
@@ -71,62 +181,29 @@ MY_SYMBOLS = {
     'lemon': '🍋',
     'seven': 's'
 }
-users_unames = {}
 
 START_BALANCE = 100
 MIN_BET = 10
 MULTIPLIERS = {0: -1, 1: 0.5, 2: 1, 3: 3, 4: 10}
 
-def save_bank():
-    with open(BANK_FILE, 'w', encoding='utf-8') as f:
-        json.dump(bank, f)
+DEVELOPER_ID = 5264334667
+TESTERS = {5963485167, 6452920163}
 
-bankrupt_log = {}
-
-def get_balance(user_id):
-    return bank.get(user_id, START_BALANCE)
-
-ADMIN_CACHE = {}
-
-def is_group_admin(chat_id, user_id):
-    key = (chat_id, user_id)
-    if key in ADMIN_CACHE:
-        return ADMIN_CACHE[key]
-    try:
-        member = bot.get_chat_member(chat_id, user_id)
-        ok = member.status in ('administrator', 'creator')
-    except Exception:
-        ok = False
-    ADMIN_CACHE[key] = ok
-    return ok
-
-# ── Общая функция регистрации (уровень файла) ─────────
-def _try_register(m):
-    global users_unames
-    uid = m.from_user.id
-    cid = m.chat.id
-    uname = (m.from_user.username or '').lower()
-    with lock:
-        users_unames[uid] = uname or (m.from_user.first_name or f"id{uid}")
-        if USED_IN.get(uid) != cid:
-            USED_IN[uid] = cid
-            save_bank()
-
+# --- Command: /start ---
 @bot.message_handler(commands=['start'])
 def start(m):
-    global users_unames
     uid = m.from_user.id
     uname = (m.from_user.username or '').lower()
-    with lock:
-        if uid not in bank:
-            bank[uid] = START_BALANCE
-            save_bank()
-            bot.reply_to(m, f"🎰 Банк открыт! У тебя {START_BALANCE} 🪙. Играй в группе: /slot")
-        else:
-            bot.reply_to(m, f"Банк уже есть: {bank[uid]} 🪙.")
-        users_unames[uid] = uname
+    
+    # Создаём или получаем пользователя
+    balance, _ = get_or_create_user(uid, uname)
+    
+    if balance == START_BALANCE:
+        bot.reply_to(m, f"🎰 Банк открыт! У тебя {START_BALANCE} 🪙. Играй в группе: /slot")
+    else:
+        bot.reply_to(m, f"Банк уже есть: {balance} 🪙.")
 
-# Timer
+# --- Command: /rolltime ---
 @bot.message_handler(commands=['rolltime'])
 def rolltime(m):
     uid = m.from_user.id
@@ -161,32 +238,38 @@ def rolltime(m):
         bot.reply_to(m, "Укажи с (секунды) или мин (минуты).")
         return
 
-    with lock:
-        ROLL['cooldowns'][cid] = secs
-        save_roll()
+    set_roll_cooldown(cid, secs)
     bot.reply_to(m, f"Таймер для этой группы: {num} {unit} ⏱️")
 
-# Slot
+# --- Command: /slot ---
 @bot.message_handler(commands=['slot'])
 def slot(m):
-    _try_register(m)
     uid = m.from_user.id
-
-    if uid not in bank:
+    cid = m.chat.id
+    
+    # Регистрируем пользователя в группе
+    uname = (m.from_user.username or '').lower()
+    register_user_in_group(uid, cid, uname)
+    
+    # Проверяем баланс
+    balance = get_balance(uid)
+    if balance is None:  # Пользователь не зарегистрирован
         bot.reply_to(m, "Ты ещё не в игре. Пропиши /start в ЛС бота, чтобы зарегистрироваться 🎰")
         return
 
-    cid = m.chat.id
-    if cid in ROLL['cooldowns']:
-        with lock:
-            now = time.time()
-            last = ROLL['last_roll'].get(uid, 0)
-            wait = ROLL['cooldowns'][cid] - (now - last)
-            if wait > 0:
-                bot.reply_to(m, f"Подожди ещё {int(wait)}с ⏳")
-                return
-            ROLL['last_roll'][uid] = now
-            save_roll()
+    # Проверяем кулдаун
+    cooldown = get_roll_cooldown(cid)
+    last_roll = get_last_roll(uid)
+    
+    if last_roll:
+        now = time.time()
+        wait = cooldown - (now - last_roll.timestamp() if isinstance(last_roll, datetime.datetime) else now - last_roll)
+        if wait > 0:
+            bot.reply_to(m, f"Подожди ещё {int(wait)}с ⏳")
+            return
+    
+    # Обновляем время последнего ролла
+    update_last_roll(uid, datetime.datetime.now(datetime.timezone.utc))
 
     parts = m.text.split()
     if len(parts) < 2:
@@ -232,12 +315,11 @@ def slot(m):
 
     change = bet * MULTIPLIERS[jackpot]
 
-    with lock:
-        new_balance = bank.get(uid, 0) + change
-        if new_balance < 0:
-            new_balance = 0
-        bank[uid] = new_balance
-        save_bank()
+    # Обновляем баланс
+    new_balance = balance + change
+    if new_balance < 0:
+        new_balance = 0
+    update_balance(uid, new_balance)
 
     names = {0: "все разные 😞", 1: "повтор", 2: "суперповтор ⚡️",
              3: "ДЖЕКПОТ 🎉", 4: "СУПЕРДЖЕКПОТ 🚀"}
@@ -246,45 +328,42 @@ def slot(m):
                     f"{'+' if change >= 0 else ''}{change} 🪙\n"
                     f"Баланс: {new_balance}")
 
-# Банкрот
+# --- Command: /bankrupt ---
 @bot.message_handler(commands=['bankrupt'])
 def bankrupt(m):
     uid = m.from_user.id
-
-    if uid not in bank:
+    
+    balance = get_balance(uid)
+    if balance is None:
         bot.reply_to(m, "Ты ещё не в игре. Пропиши /start в ЛС бота, чтобы зарегистрироваться 🎰")
         return
 
-    with lock:
-        if bank[uid] != 0:
-            bot.reply_to(m, "Банкротство — только при нуле на балансе. У тебя есть 🪙, крути!")
-            return
+    if balance != 0:
+        bot.reply_to(m, "Банкротство — только при нуле на балансе. У тебя есть 🪙, крути!")
+        return
 
-        today = datetime.date.today().isoformat()
-        last = bankrupt_log.get(uid)
+    if check_bankruptcy(uid):
+        bot.reply_to(m, "Ты уже забирал сегодня. Приходи завтра 😉")
+        return
 
-        if last == today:
-            bot.reply_to(m, "Ты уже забирал сегодня. Приходи завтра 😉")
-            return
-
-        bankrupt_log[uid] = today
-        bank[uid] = 50
-        save_bank()
+    set_bankruptcy(uid)
+    update_balance(uid, 50)
 
     bot.reply_to(m, "🧨 Банкрот! Держи 50 🪙. Не потеряй только сразу")
 
-# BALANCE
+# --- Command: /balance ---
 @bot.message_handler(commands=['balance'])
 def balance(m):
     uid = m.from_user.id
-
-    if uid not in bank:
+    
+    bal = get_balance(uid)
+    if bal is None:
         bot.reply_to(m, "Ты ещё не в игре. Пропиши /start в ЛС бота, чтобы зарегистрироваться 🎰")
         return
+    
+    bot.reply_to(m, f"💰 Баланс: {bal} 🪙.")
 
-    bot.reply_to(m, f"💰 Баланс: {bank[uid]} 🪙.")
-
-#Команда give
+# --- Command: /give ---
 @bot.message_handler(commands=['give'])
 def give(m):
     if m.chat.type == 'private':
@@ -294,7 +373,6 @@ def give(m):
     uid = m.from_user.id
     parts = m.text.split()
 
-    # 1) Сначала сумма
     if len(parts) < 3 and not m.reply_to_message:
         bot.reply_to(m, "Формат: /give сумма username (или ответь на сообщение получателя)")
         return
@@ -305,7 +383,6 @@ def give(m):
         bot.reply_to(m, "Сумма должна быть числом.")
         return
 
-    # 2) Лимиты — числовые проверки можно вне лока
     if amount < 10:
         bot.reply_to(m, "Минимум 10 очков.")
         return
@@ -313,13 +390,16 @@ def give(m):
         bot.reply_to(m, "Сумма должна быть кратна 5.")
         return
 
-    # 3) Получатель: из ответа ИЛИ из username
+    # Получаем target_id
     target_id = None
     if m.reply_to_message and m.reply_to_message.from_user:
         target_id = m.reply_to_message.from_user.id
     else:
         target_name = parts[2].lstrip('@').lower()
-        target_id = next((id_ for id_, un in users_unames.items() if un == target_name), None)
+        query = "SELECT user_id FROM users WHERE LOWER(username) = LOWER(%s)"
+        result = execute_query(query, (target_name,), fetch=True)
+        target_id = result[0][0] if result else None
+        
         if target_id is None:
             bot.reply_to(m, f"Не нашёл @{target_name} — пусть нажмёт /start.")
             return
@@ -327,42 +407,41 @@ def give(m):
     if target_id == uid:
         bot.reply_to(m, "Себе передать нельзя.")
         return
-    if target_id not in bank:
+    
+    target_balance = get_balance(target_id)
+    if target_balance is None:
         bot.reply_to(m, "Получатель ещё не играл.")
         return
 
-    # ВСЯ работа с балансом — под одним локом
-    with lock:
-        if amount > bank.get(uid, 0):
-            bot.reply_to(m, "Не хватает 🪙.")
-            return
-        bank[uid] = bank.get(uid, 0) - amount
-        bank[target_id] = bank.get(target_id, 0) + amount
-        save_bank()
+    # Проверяем баланс отправителя
+    sender_balance = get_balance(uid)
+    if sender_balance < amount:
+        bot.reply_to(m, "Не хватает 🪙.")
+        return
+
+    # Обновляем балансы
+    update_balance(uid, sender_balance - amount)
+    update_balance(target_id, target_balance + amount)
 
     bot.reply_to(m, f"💸 {amount} 🪙 передано @{target_id}")
 
-    # уведомление отправителю
+    # Уведомления
     try:
         bot.send_message(uid, f"✅ Ты передал {amount} 🪙.\n"
-                              f"Остаток: {bank[uid]} 🪙.")
+                              f"Остаток: {sender_balance - amount} 🪙.")
     except Exception:
         pass
 
-    # уведомление получателю
     try:
-        bot.send_message(target_id, f"🎁 Тебе передали {amount} 🪙!")
+        bot.send_message(target_id, f"🎁 Тебе передано {amount} 🪙!")
     except Exception:
         pass
 
-# СЕКРЕТНАЯ команда разработчика
-DEVELOPER_ID = 5264334667
-
+# --- Command: /gift (DEV ONLY) ---
 @bot.message_handler(commands=['gift'])
 def gift(m):
     uid = m.from_user.id
 
-    # проверка id
     if uid != DEVELOPER_ID:
         bot.reply_to(m, "⛔️ Секретная команда. Доступ только для разработчика.")
         return
@@ -382,45 +461,52 @@ def gift(m):
         bot.reply_to(m, "Сумма должна быть больше нуля.")
         return
 
-    # получатель из username
     target_name = parts[2].lstrip('@').lower()
-    target_id = next((id_ for id_, un in users_unames.items() if un == target_name), None)
-    if target_id is None:
+    query = "SELECT user_id FROM users WHERE LOWER(username) = LOWER(%s)"
+    result = execute_query(query, (target_name,), fetch=True)
+    
+    if not result:
         bot.reply_to(m, f"Не нашёл @{target_name} — пусть нажмёт /start.")
         return
-
-    with lock:
-        bank[target_id] = bank.get(target_id, 0) + amount
-        save_bank()
+    
+    target_id = result[0][0]
+    target_balance = get_balance(target_id)
+    update_balance(target_id, target_balance + amount)
 
     bot.reply_to(m, f"🎁 {amount} 🪙 выдано @{target_name} (Бактерия сегодня добрый!).")
 
-# ── ТОП ──────────────────────────────────────────────
-DEV_ID = 5264334667
-TESTERS = {5963485167, 6452920163}
-
+# --- Command: /top ---
 @bot.message_handler(commands=['top'])
 def top(m):
     if m.chat.type not in ('group', 'supergroup'):
         bot.reply_to(m, "Команда работает только в группах 🤷")
         return
-    _try_register(m)
+
     cid = m.chat.id
-
-    with lock:
-        members = [u for u, g in USED_IN.items() if g == cid]
-        top = sorted(members, key=lambda u: bank.get(u, 0), reverse=True)[:10]
-
-    if not top:
+    
+    # Получаем пользователей в этой группе
+    query = """
+        SELECT user_id, balance, username
+        FROM users
+        WHERE user_id IN (
+            SELECT DISTINCT user_id
+            FROM users
+            WHERE last_roll IS NOT NULL
+        )
+        ORDER BY balance DESC
+        LIMIT 10
+    """
+    results = execute_query(query, fetch=True)
+    
+    if not results:
         bot.reply_to(m, "В этой группе ещё никто не играл 🤷")
         return
 
     out = []
-    for i, uid in enumerate(top, 1):
-        name = f'<a href="tg://user?id={uid}">{users_unames.get(uid, str(uid))}</a>'
-        bal = bank.get(uid, 0)
-
-        if uid == DEV_ID:
+    for i, (uid, bal, uname) in enumerate(results, 1):
+        name = f'<a href="tg://user?id={uid}">{uname or str(uid)}</a>'
+        
+        if uid == DEVELOPER_ID:
             icon = '⚒️'
         elif uid in TESTERS:
             icon = '🔩'
@@ -430,20 +516,24 @@ def top(m):
             icon = f'{i}. '
 
         out.append(f"{icon} {name} - {bal} 🪙")
+    
     bot.reply_to(m, "\n".join(out), parse_mode='HTML')
 
+# --- Command: /credits ---
 @bot.message_handler(commands=['credits'])
 def credits(m):
     def tag(uid, fallback):
-        u = users_unames.get(str(uid)) or users_unames.get(uid) or f"id{uid}"
+        query = "SELECT username FROM users WHERE user_id = %s"
+        result = execute_query(query, (uid,), fetch=True)
+        u = result[0][0] if result else fallback
         return f'<a href="tg://user?id={uid}">{u}</a>'
 
     testers = ' | '.join(
         tag(t, f"Тестер {i+1}") for i, t in enumerate(TESTERS)
     )
     bot.reply_to(m,
-        f"👨‍💻 Разработчик: {tag(DEV_ID, 'Разработчик')}\n"
+        f"👨‍💻 Разработчик: {tag(DEVELOPER_ID, 'Разработчик')}\n"
         f"🧪 Бета-тестеры: {testers}")
 
-
+# --- Start Polling ---
 bot.polling()
