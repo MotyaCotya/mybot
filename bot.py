@@ -12,6 +12,18 @@ import datetime
 import json
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+DATA_FILE = "/data/bot_data.json"  # путь на persistent disk
+
+def load_data():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
+    return {}  # вернёт пустой словарь, если файла нет
+
+def save_data(data):
+    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 lock = threading.Lock()
 
